@@ -184,6 +184,46 @@ export interface CapacityInvalid {
 
 export type CapacityResult = CapacityOk | CapacityInvalid;
 
+// ============ 管段增容建议 ============
+
+/** 最多改造管段条数：容量由 1 提至 2。 */
+export const MAX_EXPANSION_PIPES = 2;
+
+/** 一个增容方案：将 pipes 中列出的不同管段容量各由 1 提至 2。 */
+export interface ExpansionOption {
+  /** 改造的管段编号（升序）；空数组表示不改造（基线） */
+  pipes: string[];
+  /** 该方案下的总获配量（最大流） */
+  totalAllocated: number;
+}
+
+export interface ExpansionOk {
+  status: 'ok';
+  /** 参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计），即可选改造范围 */
+  activePipeCount: number;
+  /** 可选改造的管段编号（升序）；已关阀与自环不在其中 */
+  candidatePipes: string[];
+  totalSupplyCap: number;
+  totalDemand: number;
+  /** 不改造（基线）总获配量 */
+  baselineAllocated: number;
+  /** 最优单条改造方案（无候选管段时为 null） */
+  bestSingle: ExpansionOption | null;
+  /** 最优两条组合改造方案（候选管段不足 2 条、或无需枚举时为 null） */
+  bestPair: ExpansionOption | null;
+  /** 推荐方案：总获配最高，其次改造条数最少、管段编号列表字典序最小 */
+  recommended: ExpansionOption;
+  /** 推荐相对基线的增量；为 0 时无需增容 */
+  gain: number;
+}
+
+export interface ExpansionInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ExpansionResult = ExpansionOk | ExpansionInvalid;
+
 /** 参与组合的开启阀门数量上限 */
 export const MAX_OPEN_VALVES = 12;
 /** 收集的最优方案数上限（防止结果爆炸） */
@@ -821,20 +861,21 @@ function readNonNegativeInt(value: unknown): { ok: true; n: number } | { ok: fal
   return { ok: true, n: value };
 }
 
+interface PreparedCapacityQuery {
+  supplies: string[];
+  outlets: string[];
+  supplyCapList: { supply: string; cap: number }[];
+  demandList: { outlet: string; demand: number }[];
+}
+
 /**
- * 供水能力核验：在当前阀门开闭状态下，按各供水点供给上限、各保供出口需求量，
- * 求「总供给最大分配」（单源单汇最大流），给出每个出口的获配量与缺口，
- * 并给出一组限制总供给的最小割项目（供给上限 / 连通管段 / 出口需求）。
- *
- * 建模：
- * - 超级源点 → 供水点：容量为该供水点的供给上限；
- * - 每条无阀管段与当前开启的带阀管段：双向共享容量 1 的无向边，
- *   同一管段双向合计只能占用一次，已关阀不参与；
- * - 出口 → 超级汇点：容量为该出口的需求量。
- * 多供水点上限与多出口需求经最大流同时约束。最小割中饱和跨越的弧即瓶颈项目。
- * 纯函数，不修改输入。
+ * 校验供水能力核验 / 管段增容建议共用的输入：节点存在性、名单非空、
+ * 供给上限与需求量均为非负整数。纯函数，不修改拓扑 JSON 与数值表。
  */
-export function verifyCapacity(network: Network, query: CapacityQuery): CapacityResult {
+function prepareCapacityQuery(
+  network: Network,
+  query: CapacityQuery
+): { ok: true; value: PreparedCapacityQuery } | { ok: false; errors: string[] } {
   const errors: string[] = [];
   const nodeSet = new Set(network.nodes);
 
@@ -882,7 +923,27 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
     demandList.push({ outlet: o, demand: parsed.n });
   }
 
-  if (errors.length > 0) return { status: 'invalid', errors };
+  if (errors.length > 0) return { ok: false, errors };
+  return { ok: true, value: { supplies, outlets, supplyCapList, demandList } };
+}
+
+/**
+ * 供水能力核验：在当前阀门开闭状态下，按各供水点供给上限、各保供出口需求量，
+ * 求「总供给最大分配」（单源单汇最大流），给出每个出口的获配量与缺口，
+ * 并给出一组限制总供给的最小割项目（供给上限 / 连通管段 / 出口需求）。
+ *
+ * 建模：
+ * - 超级源点 → 供水点：容量为该供水点的供给上限；
+ * - 每条无阀管段与当前开启的带阀管段：双向共享容量 1 的无向边，
+ *   同一管段双向合计只能占用一次，已关阀不参与；
+ * - 出口 → 超级汇点：容量为该出口的需求量。
+ * 多供水点上限与多出口需求经最大流同时约束。最小割中饱和跨越的弧即瓶颈项目。
+ * 纯函数，不修改输入。
+ */
+export function verifyCapacity(network: Network, query: CapacityQuery): CapacityResult {
+  const prepared = prepareCapacityQuery(network, query);
+  if (prepared.ok === false) return { status: 'invalid', errors: prepared.errors };
+  const { supplyCapList, demandList } = prepared.value;
 
   const edges = collectActiveEdges(network);
   const indexOf = new Map<string, number>();
@@ -994,5 +1055,125 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
     rows,
     cutItems,
     cutCapacity,
+  };
+}
+
+/**
+ * 在给定管段容量下计算总获配量（最大流）。
+ * 未列入 upgraded 的参与输水管段容量为 1，列入者容量为 2；
+ * 双向共享同一容量（与供水能力核验同一无向边模型）。
+ */
+function maxFlowWithExpansion(
+  nodeCount: number,
+  indexOf: Map<string, number>,
+  edges: ActiveEdge[],
+  supplyCapList: { supply: string; cap: number }[],
+  demandList: { outlet: string; demand: number }[],
+  upgraded: ReadonlySet<string>
+): number {
+  const dinic = new CapacityDinic(nodeCount);
+  const S = dinic.source;
+  const T = dinic.sink;
+  for (const { supply, cap } of supplyCapList) {
+    dinic.addArc(S, indexOf.get(supply)!, cap);
+  }
+  for (const e of edges) {
+    dinic.addUndirectedShared(indexOf.get(e.from)!, indexOf.get(e.to)!, upgraded.has(e.id) ? 2 : 1);
+  }
+  for (const { outlet, demand } of demandList) {
+    dinic.addArc(indexOf.get(outlet)!, T, demand);
+  }
+  return dinic.maxFlow(S, T);
+}
+
+/** 两个字符串列表按字典序逐项比较（均为升序列表）。 */
+function compareIdLists(a: string[], b: string[]): number {
+  const k = Math.min(a.length, b.length);
+  for (let i = 0; i < k; i++) {
+    const c = a[i].localeCompare(b[i], 'zh-Hans-CN');
+    if (c !== 0) return c;
+  }
+  return a.length - b.length;
+}
+
+/**
+ * 管段增容建议：沿用页面现有拓扑、供水点供给上限与出口需求量，
+ * 在当前阀门开闭状态下，仅将「参与输水的不同管段」容量各由 1 提至 2，
+ * 最多改造两条；已关阀及自环不参与输水，不可选。
+ *
+ * 分别计算不改造（基线）、单条改造、两条组合改造的总获配量，
+ * 允许「两条一起改造才产生收益」的情形（单条均为零增量时仍枚举两条组合）。
+ * 推荐规则：总获配量最高 → 改造条数最少 → 管段编号升序列表字典序最小。
+ * 纯函数：只读取网络与数值，不修改拓扑、阀门状态及原供水能力核验结果。
+ */
+export function suggestExpansion(network: Network, query: CapacityQuery): ExpansionResult {
+  const prepared = prepareCapacityQuery(network, query);
+  if (prepared.ok === false) return { status: 'invalid', errors: prepared.errors };
+  const { supplyCapList, demandList } = prepared.value;
+
+  const edges = collectActiveEdges(network);
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+
+  const candidatePipes = edges.map((e) => e.id).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  const totalSupplyCap = supplyCapList.reduce((sum, x) => sum + x.cap, 0);
+  const totalDemand = demandList.reduce((sum, x) => sum + x.demand, 0);
+  // 改造最多令总获配在此上限内提升，达到后更多改造不可能更优
+  const upperBound = Math.min(totalSupplyCap, totalDemand);
+
+  const run = (pipes: string[]): number =>
+    maxFlowWithExpansion(network.nodes.length, indexOf, edges, supplyCapList, demandList, new Set(pipes));
+
+  const baselineAllocated = run([]);
+  let bestSingle: ExpansionOption | null = null;
+  let bestPair: ExpansionOption | null = null;
+
+  // 单条改造：枚举按编号升序，首次取得某流量即该流量下字典序最小者
+  if (candidatePipes.length >= 1) {
+    for (const id of candidatePipes) {
+      const totalAllocated = run([id]);
+      if (!bestSingle || totalAllocated > bestSingle.totalAllocated) {
+        bestSingle = { pipes: [id], totalAllocated };
+      }
+    }
+  }
+
+  // 两条组合：仅当单条最优仍未达到理论上限时才需要（否则组合不可能更优）
+  const singleCeiling = bestSingle?.totalAllocated ?? baselineAllocated;
+  if (candidatePipes.length >= 2 && singleCeiling < upperBound) {
+    const m = candidatePipes.length;
+    for (let i = 0; i < m; i++) {
+      for (let j = i + 1; j < m; j++) {
+        const pipes = [candidatePipes[i], candidatePipes[j]];
+        const totalAllocated = run(pipes);
+        if (!bestPair || totalAllocated > bestPair.totalAllocated) {
+          bestPair = { pipes, totalAllocated };
+        }
+      }
+    }
+  }
+
+  // 推荐：总获配最高，其次改造条数最少，再按管段编号列表字典序最小
+  const candidates: ExpansionOption[] = [{ pipes: [], totalAllocated: baselineAllocated }];
+  if (bestSingle) candidates.push(bestSingle);
+  if (bestPair) candidates.push(bestPair);
+  candidates.sort((a, b) => {
+    if (b.totalAllocated !== a.totalAllocated) return b.totalAllocated - a.totalAllocated;
+    if (a.pipes.length !== b.pipes.length) return a.pipes.length - b.pipes.length;
+    return compareIdLists(a.pipes, b.pipes);
+  });
+  const recommended = candidates[0]!;
+
+  return {
+    status: 'ok',
+    activePipeCount: edges.length,
+    candidatePipes,
+    totalSupplyCap,
+    totalDemand,
+    baselineAllocated,
+    bestSingle,
+    bestPair,
+    recommended,
+    gain: recommended.totalAllocated - baselineAllocated,
   };
 }

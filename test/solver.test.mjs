@@ -389,5 +389,136 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+// ============ 管段增容建议 ============
+console.log('管段增容建议：');
+
+const exp = (supplies, outlets, supplyCaps, outletDemands) =>
+  solver.suggestExpansion(network, { supplies, outlets, supplyCaps, outletDemands });
+
+// 与核验同一基础场景：基线受 V01/V02 两条供水接入管限制，总获配 2
+const e1 = exp(['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('增容返回 ok', e1.status === 'ok');
+check('基线总获配与核验一致为 2', e1.baselineAllocated === 2);
+check('参与输水管段 10 条且均为候选（排除已关 V09）',
+  e1.activePipeCount === 10 && e1.candidatePipes.length === 10 && !e1.candidatePipes.includes('V09'));
+check('最优单条为 V01（接入管扩容，总获配升至 3）',
+  e1.bestSingle.pipes.join(',') === 'V01' && e1.bestSingle.totalAllocated === 3);
+check('两条组合不超过 3（B 单管 V08 等下游瓶颈仍在）', e1.bestPair.totalAllocated === 3);
+check('推荐为单条 V01：获配 3、增量 1、改造条数最少',
+  e1.recommended.pipes.join(',') === 'V01' &&
+  e1.recommended.totalAllocated === 3 && e1.gain === 1);
+
+console.log('增容：两条一起改造才产生收益（单条均无增量）：');
+// S—V1—N—V2—O 串联，两条单位管，S 上限 5，O 需求 2：
+// 任一单条扩容后另一条仍是单位瓶颈 → 仍为 1；两条同时扩容 → 2
+const synergyNet = {
+  nodes: ['S', 'N', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'N', open: true },
+    { id: 'V2', from: 'N', to: 'O', open: true },
+  ],
+};
+const e2 = solver.suggestExpansion(synergyNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 2 },
+});
+check('串联场景基线为 1', e2.baselineAllocated === 1);
+check('单条改造无收益（最优单条仍为 1）', e2.bestSingle.totalAllocated === 1);
+check('两条组合 V1,V2 才产生收益（升至 2）',
+  e2.bestPair.pipes.join(',') === 'V1,V2' && e2.bestPair.totalAllocated === 2);
+check('推荐两条组合、增量为 1', e2.gain === 1 && e2.recommended.pipes.join(',') === 'V1,V2');
+
+console.log('增容：无阀管段同样可改造：');
+const e2b = solver.suggestExpansion({
+  nodes: ['S', 'N', 'O'],
+  pipes: [{ id: 'P1', from: 'N', to: 'O' }],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'N', open: true }],
+}, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 2 },
+});
+check('无阀管段 P1 与阀门 V1 均为候选', e2b.candidatePipes.join(',') === 'P1,V1');
+check('两条组合 P1,V1 后获配 2', e2b.recommended.pipes.join(',') === 'P1,V1' && e2b.gain === 1);
+
+console.log('增容：已关阀与自环不可选：');
+const loopNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [{ id: 'L1', from: 'X', to: 'X' }],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'L2', from: 'S', to: 'S', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+    { id: 'L3', from: 'O', to: 'O', open: false },
+  ],
+};
+const e3 = solver.suggestExpansion(loopNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 2 },
+});
+check('候选仅为开启且非自环的 V1（自环与已关阀排除）', e3.candidatePipes.join(',') === 'V1');
+check('两条组合为 null（候选不足 2 条）', e3.bestPair === null);
+check('唯一通路 V09 侧已关：基线 0，改造 V1 也无法到 O', e3.baselineAllocated === 0 && e3.gain === 0);
+check('零增量推荐不改造（空清单）', e3.recommended.pipes.length === 0);
+
+console.log('增容：零增量时无需增容（受供给上限约束）：');
+const e4 = solver.suggestExpansion(parNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 1 }, outletDemands: { O: 5 },
+});
+check('供给上限 1 时基线即为 1', e4.baselineAllocated === 1);
+check('单条改造已达理论上限，无需枚举两条组合', e4.bestSingle.totalAllocated === 1 && e4.bestPair === null);
+check('推荐不改造、增量 0', e4.gain === 0 && e4.recommended.pipes.length === 0);
+
+console.log('增容：零需求时无需增容：');
+const e5 = exp(['S1'], ['B'], { S1: 5 }, { B: 0 });
+check('需求为 0 时基线 0、推荐不改造', e5.status === 'ok' && e5.baselineAllocated === 0 && e5.gain === 0);
+
+console.log('增容：字典序取舍（等价方案取编号最小）：');
+// S 经三条并行单位管到 O，上限/需求均为 5：基线 3，任扩一条 4，扩两条 5
+const lexNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V3', from: 'S', to: 'O', open: true },
+    { id: 'V1', from: 'S', to: 'O', open: true },
+    { id: 'V2', from: 'S', to: 'O', open: true },
+  ],
+};
+const e6 = solver.suggestExpansion(lexNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 5 },
+});
+check('候选按编号升序 V1,V2,V3', e6.candidatePipes.join(',') === 'V1,V2,V3');
+check('基线 3、单条等价时推荐字典序最小 V1（4）',
+  e6.baselineAllocated === 3 && e6.bestSingle.pipes[0] === 'V1' && e6.bestSingle.totalAllocated === 4);
+check('两条组合获配 5 优于单条 4，推荐字典序最小组合 V1,V2',
+  e6.recommended.pipes.join(',') === 'V1,V2' && e6.recommended.totalAllocated === 5);
+
+console.log('增容：无任何参与输水管段：');
+const e7 = solver.suggestExpansion({
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: false }],
+}, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 2 },
+});
+check('无候选管段时单条/两条均为 null', e7.bestSingle === null && e7.bestPair === null);
+check('推荐不改造，基线 0、增量 0', e7.recommended.pipes.length === 0 && e7.baselineAllocated === 0 && e7.gain === 0);
+
+console.log('增容：纯函数与输入校验：');
+const beforeExp = JSON.stringify(network);
+exp(['S1', 'S2'], ['B', 'C'], { S1: 5, S2: 3 }, { B: 2, C: 1 });
+check('增容不修改输入网络与数值', JSON.stringify(network) === beforeExp);
+const ee1 = exp(['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
+check('供水点不存在时报错', ee1.status === 'invalid');
+const ee2 = exp(['S1'], [], { S1: 1 }, {});
+check('缺少出口时报错', ee2.status === 'invalid');
+const ee3 = exp(['S1'], ['B'], { S1: -1 }, { B: 1 });
+check('负整数上限被拒绝', ee3.status === 'invalid' && ee3.errors.some((x) => x.includes('非负整数')));
+const ee4 = exp(['S1'], ['B'], {}, { B: 1 });
+check('缺少供给上限被拒绝', ee4.status === 'invalid');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
