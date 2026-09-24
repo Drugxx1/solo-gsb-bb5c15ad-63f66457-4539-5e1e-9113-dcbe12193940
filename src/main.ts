@@ -4,12 +4,17 @@ import {
   solve,
   inspectResilience,
   verifyCapacity,
+  suggestExpansion,
   MAX_OPEN_VALVES,
+  EXPANSION_TARGET_CAPACITY,
+  MAX_EXPANSION_PIPES,
   type Query,
   type CapacityQuery,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
+  type ExpansionResult,
+  type ExpansionPlan,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -26,7 +31,8 @@ app.innerHTML = `
     <p class="subtitle">
       粘贴管网拓扑 JSON，指定供水点、漏点与保供出口，可自动搜索最优关阀组合，
       也可对各保供出口做「保供韧性巡检」（按当前阀门开闭状态估算使其断水至少需失效的管段数），
-      还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割）。
+      还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
+      并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -60,7 +66,7 @@ app.innerHTML = `
         巡检沿用上方「供水点」与「保供出口」：无阀管段与开启的带阀管段均按单条失效计，
         已关阀不参与；多供水点作为整体，环路及并行管段分别计数。
       </p>
-      <h2>3. 供水能力核验</h2>
+      <h2>3. 供水能力核验与管段增容</h2>
       <p class="hint">
         为每个供水点填写非负整数<strong>供给上限</strong>、为每个保供出口填写非负整数<strong>需求量</strong>，
         按当前阀门开闭状态求总供给最大分配（每条连通管段容量为 1、同一无向管段双向合计只能占用一次，
@@ -72,7 +78,14 @@ app.innerHTML = `
       </div>
       <div class="button-row">
         <button id="verify-capacity" type="button" class="secondary">核验供水能力</button>
+        <button id="suggest-expansion" type="button" class="secondary">管段增容建议</button>
       </div>
+      <p class="hint">
+        增容建议沿用本页拓扑与上方填写的供给上限 / 需求量：仅将参与输水的不同管段（无阀管段或开启阀门）
+        容量各由 1 提至 ${EXPANSION_TARGET_CAPACITY}，最多改造 ${MAX_EXPANSION_PIPES} 条；
+        已关阀及自环不可选。分别计算不改造、单条与两条组合的总获配量，按
+        「总获配量最高 → 改造条数最少 → 管段编号列表字典序最小」推荐方案。
+      </p>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -97,6 +110,15 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>管段增容建议</h2>
+        <div id="expansion-result">
+          <p class="hint">
+            点击「管段增容建议」后，这里对比不改造、单条与两条组合改造的总获配量，
+            推荐总获配量最高、改造条数最少、管段编号字典序最小的方案；零增量时提示无需增容。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -115,6 +137,7 @@ const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
 const capacityResultEl = el<HTMLDivElement>('#capacity-result');
+const expansionResultEl = el<HTMLDivElement>('#expansion-result');
 
 /** 已生成填写表对应的供水点 / 保供出口，以及各输入框当前值。 */
 interface CapacityFormState {
@@ -448,6 +471,92 @@ function renderCapacity(result: CapacityResult): void {
     </p>`;
 }
 
+/** 渲染方案明细行（不改造 / 单条最优 / 两条最优），推荐方案所在行加标记。 */
+function expansionPlanRow(
+  label: string,
+  plan: ExpansionPlan | null,
+  recommended: ExpansionPlan
+): string {
+  if (!plan) {
+    return `
+      <tr>
+        <td>${label}</td>
+        <td class="hint">—（候选不足）</td>
+        <td class="num">—</td>
+        <td class="num">—</td>
+      </tr>`;
+  }
+  const isRecommended =
+    plan.upgraded.length === recommended.upgraded.length &&
+    plan.upgraded.every((p, i) => p === recommended.upgraded[i]);
+  const pipes =
+    plan.upgraded.length > 0
+      ? plan.upgraded.map((p) => `<code>${escapeHtml(p)}</code>`).join('、')
+      : '<span class="hint">（不改造）</span>';
+  return `
+    <tr>
+      <td>
+        ${label}
+        ${isRecommended ? '<span class="tag tag-ok">推荐</span>' : ''}
+      </td>
+      <td>${pipes}</td>
+      <td class="num"><strong>${plan.totalAllocated}</strong></td>
+      <td class="num ${plan.gain > 0 ? 'ok' : ''}">${plan.gain > 0 ? `+${plan.gain}` : '0'}</td>
+    </tr>`;
+}
+
+function renderExpansion(result: ExpansionResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(expansionResultEl, '输入有误，无法给出增容建议：', result.errors);
+    return;
+  }
+
+  const rec = result.recommended;
+  const recPipes =
+    rec.upgraded.length > 0
+      ? rec.upgraded.map((p) => `<code>${escapeHtml(p)}</code>`).join('、')
+      : '（不改造）';
+  const banner =
+    rec.gain > 0
+      ? `建议改造 <strong>${rec.upgraded.length}</strong> 条管段：${recPipes}（容量各由 1 提至 ${EXPANSION_TARGET_CAPACITY}）。
+         总获配量由基线 <strong>${result.baseline}</strong> 提升至 <strong>${rec.totalAllocated}</strong>，
+         增量 <strong>+${rec.gain}</strong>。`
+      : `无需增容：不改造即达最高总获配量 <strong>${result.baseline}</strong>；
+         改造任意单条或两条管段（容量由 1 提至 ${EXPANSION_TARGET_CAPACITY}）均无额外收益。`;
+  const bannerClass = rec.gain > 0 ? 'success' : 'warn';
+
+  const noUpgradePlan: ExpansionPlan = {
+    upgraded: [],
+    totalAllocated: result.baseline,
+    gain: 0,
+  };
+
+  expansionResultEl.innerHTML = `
+    <div class="banner ${bannerClass}">${banner}</div>
+    <table>
+      <thead>
+        <tr><th>方案</th><th>改造管段编号</th><th>总获配量</th><th>相对基线增量</th></tr>
+      </thead>
+      <tbody>
+        ${expansionPlanRow('不改造（基线）', noUpgradePlan, rec)}
+        ${expansionPlanRow('单条改造最优', result.bestSingle, rec)}
+        ${expansionPlanRow('两条组合改造最优', result.bestPair, rec)}
+      </tbody>
+    </table>
+    <p class="hint">
+      基线总获配量 <strong>${result.baseline}</strong>，推荐总获配量
+      <strong>${rec.totalAllocated}</strong>，增量 <strong>+${rec.gain}</strong>；
+      推荐管段编号：${recPipes}。
+    </p>
+    <p class="hint">
+      候选管段为参与输水的不同管段（无阀管段 + 当前开启的带阀管段），共
+      <strong>${result.activePipeCount}</strong> 条；已关阀及自环不可选。
+      已枚举不改造、全部单条与全部两条组合（含「两条一起改造才产生收益」的情形），
+      按总获配量最高、改造条数最少、管段编号（升序）列表字典序最小取舍。
+      增容仅为方案测算，不会改写拓扑或已核验的供水能力结果。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -513,6 +622,31 @@ function runCapacity(): void {
   }
 }
 
+function runExpansion(): void {
+  try {
+    const network = readNetwork();
+    if (!capacityFormState) {
+      renderErrors(expansionResultEl, '请先填写核验数值：', ['点击「按上方供水点 / 保供出口生成填写表」，为各点填写非负整数后再生成增容建议。']);
+      return;
+    }
+    const { supplyCaps, outletDemands, errors: formErrors } = readCapacityNumbers();
+    if (formErrors.length > 0) {
+      renderErrors(expansionResultEl, '填写有误：', formErrors);
+      return;
+    }
+    // 与供水能力核验共用同一份拓扑、供给上限与出口需求输入（填写表为权威名单）
+    const capacityQuery: CapacityQuery = {
+      supplies: capacityFormState.supplies,
+      outlets: capacityFormState.outlets,
+      supplyCaps,
+      outletDemands,
+    };
+    renderExpansion(suggestExpansion(network, capacityQuery));
+  } catch (e) {
+    renderErrors(expansionResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -522,11 +656,13 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   run();
   runInspection();
   runCapacity();
+  runExpansion();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
 el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
 el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity);
+el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点

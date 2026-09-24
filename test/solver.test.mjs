@@ -389,5 +389,102 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+// ============ 管段增容建议 ============
+console.log('管段增容建议：');
+
+const exp = (net, supplies, outlets, supplyCaps, outletDemands) =>
+  solver.suggestExpansion(net, { supplies, outlets, supplyCaps, outletDemands });
+
+// 与核验同一网络与数值：基线受 V01/V02 入环限制为 2；
+// 单条 V01（或 V02）提容即可到 3，字典序最小为 [V01]
+const e1 = exp(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('增容返回 ok', e1.status === 'ok');
+check('基线总获配与核验一致（2）', e1.baseline === 2);
+check('推荐单条改造 V01（同增量下条数最少、字典序最小）', e1.recommended.upgraded.join(',') === 'V01');
+check('推荐总获配 3、增量 1', e1.recommended.totalAllocated === 3 && e1.recommended.gain === 1);
+check('单条最优即推荐方案', e1.bestSingle.upgraded.join(',') === 'V01' && e1.bestSingle.totalAllocated === 3);
+check('两条最优同样为 3（字典序最小对 [P1,V01]）',
+  e1.bestPair.totalAllocated === 3 && e1.bestPair.upgraded.join(',') === 'P1,V01');
+check('候选管段数（2 无阀 + 8 开启，排除已关 V09）', e1.activePipeCount === 10);
+check('已关阀 V09 不出现在任何方案中',
+  !e1.recommended.upgraded.includes('V09') && !e1.bestSingle.upgraded.includes('V09') &&
+  !e1.bestPair.upgraded.includes('V09'));
+
+console.log('增容：两条一起改造才产生收益（串联瓶颈）：');
+// S—V1—M—V2—O 串联：单条提容仍受另一条限制，两条一起才通
+const seriesNet = {
+  nodes: ['S', 'M', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'O', open: true },
+  ],
+};
+const e2 = exp(seriesNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('串联基线为 1', e2.baseline === 1);
+check('单条改造无收益', e2.bestSingle.totalAllocated === 1 && e2.bestSingle.gain === 0);
+check('两条一起改造提升至 2', e2.bestPair.totalAllocated === 2 && e2.bestPair.gain === 1);
+check('推荐两条组合 [V1,V2]', e2.recommended.upgraded.join(',') === 'V1,V2' &&
+  e2.recommended.totalAllocated === 2 && e2.recommended.gain === 1);
+
+console.log('增容：零增量时推荐不改造：');
+// 供给上限 1 卡住总获配，管段提容无收益
+const noGainNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const e3 = exp(noGainNet, ['S'], ['O'], { S: 1 }, { O: 5 });
+check('受供给上限 1 限制，基线 1', e3.baseline === 1);
+check('推荐不改造（空清单、增量 0）',
+  e3.recommended.upgraded.length === 0 && e3.recommended.gain === 0 && e3.recommended.totalAllocated === 1);
+check('单条最优同样无收益', e3.bestSingle.totalAllocated === 1 && e3.bestSingle.gain === 0);
+check('仅一条候选时无两条组合', e3.bestPair === null);
+
+console.log('增容：已关阀与自环不可选：');
+const skipNet = {
+  nodes: ['S', 'O'],
+  pipes: [{ id: 'P0', from: 'S', to: 'S' }], // 自环
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'O', open: true },
+    { id: 'V9', from: 'S', to: 'O', open: false }, // 已关阀
+  ],
+};
+const e4 = exp(skipNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('候选仅 1 条（自环与已关阀不计）', e4.activePipeCount === 1);
+check('推荐改造 V1 提容至 2', e4.recommended.upgraded.join(',') === 'V1' && e4.recommended.totalAllocated === 2);
+check('无两条组合可选', e4.bestPair === null);
+
+console.log('增容：两条组合按编号列表字典序取舍：');
+// 两条并联支路 S—V1—A—V2—O 与 S—V3—B—V4—O，改造任一支路的两条管均可 +1
+const twoPairNet = {
+  nodes: ['S', 'A', 'B', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'A', open: true },
+    { id: 'V2', from: 'A', to: 'O', open: true },
+    { id: 'V3', from: 'S', to: 'B', open: true },
+    { id: 'V4', from: 'B', to: 'O', open: true },
+  ],
+};
+const e5 = exp(twoPairNet, ['S'], ['O'], { S: 9 }, { O: 9 });
+check('双支路基线 2', e5.baseline === 2);
+check('单条改造无收益（支路串联）', e5.bestSingle.totalAllocated === 2);
+check('推荐字典序最小对 [V1,V2] → 3',
+  e5.recommended.upgraded.join(',') === 'V1,V2' && e5.recommended.totalAllocated === 3 && e5.recommended.gain === 1);
+
+console.log('增容：纯函数与输入校验：');
+const beforeExp = JSON.stringify(network);
+exp(network, ['S1', 'S2'], ['B'], { S1: 2, S2: 2 }, { B: 3 });
+check('增容不修改输入网络', JSON.stringify(network) === beforeExp);
+const ee1 = exp(network, ['S1'], ['B'], { S1: -1 }, { B: 1 });
+check('负整数上限被拒绝', ee1.status === 'invalid' && ee1.errors.some((e) => e.includes('非负整数')));
+const ee2 = exp(network, ['S1'], ['B'], {}, { B: 1 });
+check('缺少上限被拒绝', ee2.status === 'invalid');
+const ee3 = exp(network, [], ['B'], {}, { B: 1 });
+check('缺少供水点被拒绝', ee3.status === 'invalid');
+const ee4 = exp(network, ['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
+check('供水点不存在时报错', ee4.status === 'invalid');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
